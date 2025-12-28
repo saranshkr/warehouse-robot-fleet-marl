@@ -1,0 +1,27 @@
+# TA-RWARE env configuration
+seed: 0
+device: cpu
+
+# If you know the exact env id, this is best:
+# env_id: "tarware-small-2agvs-2pickers-partialobs-v1"
+
+layout: small
+obs_mode: partialobs
+version: v1
+
+max_steps: 500
+
+# Robot fleet
+n_agv: 2
+n_picker: 2
+
+# Demand / orders (not used by wrapper yet; kept for later)
+order_rate: 1.0
+burst:
+  enabled: false
+  start_step: 200
+  end_step: 300
+  multiplier: 3.0
+
+# Action space (macro actions)
+n_actions: null  # if null, infer/pad from env action_space

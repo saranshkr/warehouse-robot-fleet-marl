@@ -1,0 +1,28 @@
+# --- OS junk ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environments ---
+.venv/
+venv/
+env/
+
+# --- Packaging / builds ---
+build/
+dist/
+*.egg-info/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE/editor ---
+.vscode/
+.idea/
