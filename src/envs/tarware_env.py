@@ -21,7 +21,8 @@ Reward/terminated/truncated may be per-agent lists; we reduce to episode-level d
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, Optional, Sequence, Tuple, Union, Mapping
 
 import numpy as np
 import torch
@@ -43,6 +44,21 @@ def _bool_any(x: Any) -> bool:
         return bool(x)
     arr = np.asarray(x, dtype=bool)
     return bool(arr.any())
+
+
+
+def cfg_from_dict(d: Any) -> TARWareEnvConfig:
+    """Create TARWareEnvConfig from a dict (YAML) or return it if already TARWareEnvConfig."""
+    if isinstance(d, TARWareEnvConfig):
+        return d
+    if is_dataclass(d):
+        d = asdict(d)
+    if not isinstance(d, dict):
+        raise TypeError(f"cfg_from_dict expected dict or TARWareEnvConfig, got {type(d)}")
+
+    fields = set(TARWareEnvConfig.__dataclass_fields__.keys())  # type: ignore[attr-defined]
+    filtered = {k: v for k, v in d.items() if k in fields}
+    return TARWareEnvConfig(**filtered)
 
 
 @dataclass
@@ -372,7 +388,7 @@ class TARWareTorchRLEnv(EnvBase):
         """
         if isinstance(obs, dict):
             # Unlikely for TA-RWARE, but support it anyway
-            keys = list(obs.keys())
+            keys = sorted(obs.keys())
             obs_list = [np.asarray(obs[k], dtype=np.float32).reshape(-1) for k in keys]
         elif isinstance(obs, (tuple, list)):
             obs_list = [np.asarray(o, dtype=np.float32).reshape(-1) for o in obs]
@@ -381,6 +397,9 @@ class TARWareTorchRLEnv(EnvBase):
             if arr.ndim == 1:
                 arr = arr[None, :]
             return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
+
+        if hasattr(self, "n_agents") and len(obs_list) != self.n_agents:
+            raise RuntimeError(f"Obs has {len(obs_list)} agents but wrapper expects {self.n_agents}.")
 
         n_agents = len(obs_list)
         max_dim = max(int(o.shape[0]) for o in obs_list)
@@ -408,9 +427,17 @@ class TARWareTorchRLEnv(EnvBase):
             "valid_actions_mask",
         ):
             if k in info:
-                m = np.asarray(info[k], dtype=bool)
+                m_raw = info[k]
+
+                # Handle list/tuple of per-agent masks cleanly (avoids dtype=object arrays)
+                if isinstance(m_raw, (list, tuple)) and len(m_raw) == self.n_agents:
+                    m = np.stack([np.asarray(x, dtype=bool).reshape(-1) for x in m_raw], axis=0)  # [A, K]
+                else:
+                    m = np.asarray(m_raw, dtype=bool)
+
                 if m.ndim == 1:
                     m = np.tile(m[None, :], (self.n_agents, 1))
+
                 mask = np.zeros((self.n_agents, self.n_actions), dtype=bool)
                 mask[:, : min(self.n_actions, m.shape[1])] = m[:, : self.n_actions]
                 return torch.as_tensor(mask, dtype=torch.bool, device=self.device)
@@ -419,7 +446,11 @@ class TARWareTorchRLEnv(EnvBase):
         for meth in ("get_action_mask", "get_action_masks", "action_masks", "get_avail_actions"):
             fn = getattr(self._env, meth, None)
             if callable(fn):
-                m = np.asarray(fn(), dtype=bool)
+                m_raw = fn()
+                if isinstance(m_raw, (list, tuple)) and len(m_raw) == self.n_agents:
+                    m = np.stack([np.asarray(x, dtype=bool).reshape(-1) for x in m_raw], axis=0)
+                else:
+                    m = np.asarray(m_raw, dtype=bool)
                 if m.ndim == 1:
                     m = np.tile(m[None, :], (self.n_agents, 1))
                 mask = np.zeros((self.n_agents, self.n_actions), dtype=bool)

@@ -35,7 +35,7 @@ def main() -> None:
     import torch
     from torchrl.envs.utils import check_env_specs
 
-    from src.envs.tarware_env import TARWareEnvConfig, TARWareTorchRLEnv
+    from src.envs.tarware_env import TARWareEnvConfig, TARWareTorchRLEnv, cfg_from_dict
     from src.baselines.random_policy import random_valid_actions
 
     # allow both:
@@ -52,7 +52,7 @@ def main() -> None:
     env_cfg_clean = {k: v for k, v in env_cfg_dict.items() if k in allowed}
     env_cfg = TARWareEnvConfig(**env_cfg_clean)
 
-    env = TARWareTorchRLEnv(env_cfg, device=device)
+    env = TARWareTorchRLEnv(cfg_from_dict(env_cfg), device=device)
     check_env_specs(env)
 
     td = env.reset()
