@@ -1,40 +1,27 @@
-# MAPPO (CTDE) defaults
+# MAPPO v1 (custom) for TA-RWARE (CTDE)
 seed: 0
-
-# Data collection
-frames_per_batch: 6000
-max_grad_norm: 1.0
-
-# PPO / GAE
-gamma: 0.99
-lambda: 0.95
-clip_epsilon: 0.2
-entropy_coef: 0.01
-value_coef: 0.5
 
 # Optimization
 lr: 3.0e-4
-num_epochs: 10
-minibatch_size: 512
+max_grad_norm: 0.5
 
 # Model
 hidden_size: 256
 n_layers: 2
-use_gru: false
 
-# Multi-agent structure
-# Start simple + stable:
-# - separate actors per role (agv / picker)
-# - centralized critic with concatenated observations
-actors:
-  separate_by_role: true
-critic:
-  centralized: true
-  input: concat_all_agent_obs
+# Rollout + PPO
+rollout_T: 256
+ppo_epochs: 4
+minibatch_size: 64
 
-# Action masking
-use_action_mask: true
+# GAE / PPO
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+entropy_coef: 0.01
+value_coef: 0.5
 
-# Logging
+# Run control
+iters: 2000
 log_every: 1
-save_every: 10
+save_every: 50

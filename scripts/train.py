@@ -1,28 +1,28 @@
-"""Train MAPPO on TA-RWARE using TorchRL primitives.
+"""Train MAPPO (custom) on TA-RWARE using TorchRL EnvBase wrapper.
 
-This script is intentionally minimal:
-- build EnvBase wrapper
-- collect on-policy rollouts
-- compute GAE
-- optimize PPO-style objective
-
-You will likely adapt the following to your TorchRL version:
-- collector usage (SyncDataCollector vs other)
-- ReplayBuffer/ storage (optional; for on-policy you can train directly on the batch)
-- ProbabilisticActor wrappers
+Minimal, practical MAPPO v1:
+- 2 actors: AGV + Picker
+- 1 centralized critic: V(s) where s = concat(all obs)
+- Team reward: mean over agents (you can switch to sum)
+- Action masking on day 1
+- On-policy rollout buffer + PPO update
 
 Usage:
-  python scripts/train.py --env configs/env_default.yaml --algo configs/mappo_default.yaml
+  python -m scripts.train --env configs/env_default.yaml --algo configs/mappo_default.yaml
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Dict, Any
-
-import json
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+from torchrl.envs.utils import check_env_specs
+from src.envs.tarware_env import TARWareTorchRLEnv, cfg_from_dict
 
 from src.utils.config import load_yaml, merge_dicts
 from src.utils.seeding import seed_everything
@@ -36,6 +36,85 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _get_step_fields(td):
+    """TorchRL env.step may return either plain keys or put them under 'next'."""
+    if td.get(("next", "agents", "observation")) is not None:
+        nxt = td.get("next")
+        return (
+            nxt.get(("agents", "observation")),
+            nxt.get(("agents", "action_mask")),
+            nxt.get(("agents", "reward")),
+            nxt.get("done"),
+            nxt,
+        )
+    return (
+        td.get(("agents", "observation")),
+        td.get(("agents", "action_mask")),
+        td.get(("agents", "reward")),
+        td.get("done"),
+        td,
+    )
+
+
+def _mask_logits(logits, mask):
+    # mask: True means valid
+    return logits.masked_fill(~mask, -1e9)
+
+
+def compute_gae(
+    rewards: "torch.Tensor",     # [T]
+    values: "torch.Tensor",      # [T]
+    dones: "torch.Tensor",       # [T] bool or {0,1}
+    last_value: "torch.Tensor",  # scalar
+    gamma: float,
+    lam: float,
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    """GAE for scalar team reward + scalar V(s). Returns (adv, returns), both [T]."""
+
+    T = rewards.shape[0]
+    adv = torch.zeros(T, device=rewards.device, dtype=torch.float32)
+    gae = torch.tensor(0.0, device=rewards.device)
+
+    for t in reversed(range(T)):
+        nonterminal = 1.0 - dones[t].float()
+        v_next = last_value if t == T - 1 else values[t + 1]
+        delta = rewards[t] + gamma * nonterminal * v_next - values[t]
+        gae = delta + gamma * lam * nonterminal * gae
+        adv[t] = gae
+
+    ret = adv + values
+    return adv, ret
+
+
+@dataclass
+class ActorCritic:
+    actor_agv: "torch.nn.Module"
+    actor_picker: "torch.nn.Module"
+    critic: "torch.nn.Module"
+
+
+def build_actor(obs_dim: int, n_actions: int, hidden: int, n_layers: int):
+    layers = []
+    in_dim = obs_dim
+    for _ in range(n_layers):
+        layers.append(torch.nn.Linear(in_dim, hidden))
+        layers.append(torch.nn.ReLU())
+        in_dim = hidden
+    layers.append(torch.nn.Linear(in_dim, n_actions))
+    return torch.nn.Sequential(*layers)
+
+
+def build_critic(state_dim: int, hidden: int, n_layers: int):
+    layers = []
+    in_dim = state_dim
+    for _ in range(n_layers):
+        layers.append(torch.nn.Linear(in_dim, hidden))
+        layers.append(torch.nn.ReLU())
+        in_dim = hidden
+    layers.append(torch.nn.Linear(in_dim, 1))
+    return torch.nn.Sequential(*layers)
+
+
 def main() -> None:
     args = parse_args()
     env_cfg = load_yaml(args.env)
@@ -45,159 +124,254 @@ def main() -> None:
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out) / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = out_dir / "checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
     (out_dir / "configs").mkdir(exist_ok=True)
-
-    # Save configs
     (out_dir / "configs" / "env.yaml").write_text(Path(args.env).read_text())
     (out_dir / "configs" / "algo.yaml").write_text(Path(args.algo).read_text())
+    
+    save_every = int(algo_cfg.get("save_every", 50))
 
     seed_everything(int(algo_cfg.get("seed", env_cfg.get("seed", 0))))
 
-    try:
-        import torch
-    except Exception as e:
-        raise RuntimeError("torch is required") from e
-
-    # TorchRL imports (fail fast with clear error)
-    try:
-        from torchrl.collectors import SyncDataCollector
-        from torchrl.envs.utils import check_env_specs
-        from tensordict.nn import TensorDictModule
-        from torchrl.modules import ProbabilisticActor
-        from torchrl.modules.distributions import MaskedCategorical
-    except Exception as e:
-        raise RuntimeError(
-            "TorchRL / TensorDict not installed (or version mismatch). "
-            "Install from requirements.txt and ensure torchrl imports work."
-        ) from e
-
-    from src.envs.tarware_env import TARWareTorchRLEnv
-    from src.algos.mappo.networks import build_modules
-    from src.algos.mappo.loss import PPOClipLoss
-
     device = torch.device(env_cfg.get("device", "cpu"))
 
-    env = TARWareTorchRLEnv(env_cfg, device=device)
+    env = TARWareTorchRLEnv(cfg_from_dict(env_cfg), device=device)
     check_env_specs(env)
 
-    # Specs
     n_agents = env.n_agents
     obs_dim = env.obs_dim
     n_actions = env.n_actions
 
-    modules = build_modules(
-        obs_dim=obs_dim,
-        n_actions=n_actions,
-        n_agents_total=n_agents,
-        hidden_size=int(algo_cfg.get("hidden_size", 256)),
-        n_layers=int(algo_cfg.get("n_layers", 2)),
+    n_agv = int(env_cfg.get("n_agv", n_agents))
+    n_picker = int(env_cfg.get("n_picker", max(0, n_agents - n_agv)))
+    assert n_agv + n_picker == n_agents, f"n_agv+n_picker must equal n_agents ({n_agents})"
+
+    agv_idx = torch.arange(0, n_agv, device=device)
+    picker_idx = torch.arange(n_agv, n_agents, device=device)
+
+    hidden = int(algo_cfg.get("hidden_size", 256))
+    n_layers = int(algo_cfg.get("n_layers", 2))
+
+    model = ActorCritic(
+        actor_agv=build_actor(obs_dim, n_actions, hidden, n_layers).to(device),
+        actor_picker=build_actor(obs_dim, n_actions, hidden, n_layers).to(device),
+        critic=build_critic(n_agents * obs_dim, hidden, n_layers).to(device),
     )
 
-    # TODO(role split): map agent indices -> role groups based on your TA-RWARE env.
-    # For now, treat *all* agents as using the same actor (swap later).
-
-    actor_net = modules.actor_agv.to(device)
-    critic_net = modules.critic.to(device)
-
-    # Actor wrapper: obs -> logits
-    actor_td = TensorDictModule(
-        actor_net,
-        in_keys=[("agents", "observation")],
-        out_keys=[("agents", "logits")],
+    lr = float(algo_cfg.get("lr", 3e-4))
+    optim = torch.optim.Adam(
+        list(model.actor_agv.parameters())
+        + list(model.actor_picker.parameters())
+        + list(model.critic.parameters()),
+        lr=lr,
     )
 
-    # Probabilistic actor: logits (+ mask) -> action + log_prob
-    policy = ProbabilisticActor(
-        module=actor_td,
-        in_keys=[("agents", "logits"), ("agents", "action_mask")],
-        distribution_class=MaskedCategorical,
-        distribution_kwargs={"mask": ("agents", "action_mask")},
-        return_log_prob=True,
-        out_keys=[("agents", "action")],
-    )
+    # MAPPO hyperparams
+    rollout_T = int(algo_cfg.get("rollout_T", 256))
+    ppo_epochs = int(algo_cfg.get("ppo_epochs", 4))
+    minibatch_size = int(algo_cfg.get("minibatch_size", 64))
+    gamma = float(algo_cfg.get("gamma", 0.99))
+    lam = float(algo_cfg.get("gae_lambda", 0.95))
+    clip_eps = float(algo_cfg.get("clip_epsilon", 0.2))
+    entropy_coef = float(algo_cfg.get("entropy_coef", 0.01))
+    value_coef = float(algo_cfg.get("value_coef", 0.5))
+    max_grad_norm = float(algo_cfg.get("max_grad_norm", 0.5))
+    log_every = int(algo_cfg.get("log_every", 1))
+    total_iters = int(algo_cfg.get("iters", 2000))
 
-    # Critic wrapper: concat obs -> state_value
-    def _concat_obs(td):
-        obs = td.get(("agents", "observation"))  # [..., n_agents, obs_dim]
-        flat = obs.reshape(*obs.shape[:-2], -1)
-        return flat
+    # Optional: reproducible sampling stream
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(algo_cfg.get("seed", 0)))
 
-    class CriticWrapper(torch.nn.Module):
-        def __init__(self, critic):
-            super().__init__()
-            self.critic = critic
+    def policy_act(obs, mask):
+        """obs: [A, obs_dim], mask: [A, n_actions] -> action [A], logp [A], entropy [A]"""
+        logits = torch.zeros((n_agents, n_actions), device=device, dtype=torch.float32)
 
-        def forward(self, obs_flat):
-            return self.critic(obs_flat)
+        if n_agv > 0:
+            logits_agv = model.actor_agv(obs.index_select(0, agv_idx))
+            logits.index_copy_(0, agv_idx, logits_agv)
 
-    critic_td = TensorDictModule(
-        CriticWrapper(critic_net),
-        in_keys=[("_global", "obs_flat")],
-        out_keys=[("_global", "state_value")],
-    )
+        if n_picker > 0:
+            logits_pick = model.actor_picker(obs.index_select(0, picker_idx))
+            logits.index_copy_(0, picker_idx, logits_pick)
 
-    # Loss + optim
-    loss_fn = PPOClipLoss(
-        clip_epsilon=float(algo_cfg.get("clip_epsilon", 0.2)),
-        entropy_coef=float(algo_cfg.get("entropy_coef", 0.01)),
-        value_coef=float(algo_cfg.get("value_coef", 0.5)),
-    )
+        logits = _mask_logits(logits, mask)
 
-    optim = torch.optim.Adam(list(actor_net.parameters()) + list(critic_net.parameters()), lr=float(algo_cfg.get("lr", 3e-4)))
+        dist = torch.distributions.Categorical(logits=logits)
+        action = dist.sample()
+        logp = dist.log_prob(action)
+        ent = dist.entropy()
+        return action.to(torch.int64), logp, ent
 
-    frames_per_batch = int(algo_cfg.get("frames_per_batch", 6000))
+    def critic_value(obs):
+        """obs: [A, obs_dim] -> scalar V"""
+        flat = obs.reshape(-1)  # [A*obs_dim]
+        v = model.critic(flat).squeeze(-1)  # scalar
+        return v
 
-    # Collector: rollout with current policy
-    collector = SyncDataCollector(
-        env,
-        policy,
-        frames_per_batch=frames_per_batch,
-        total_frames=frames_per_batch * 10_000,  # effectively "infinite"; you stop manually
-        device=device,
-        storing_device=device,
-    )
+    # ---------------- training loop ----------------
+    it = 0
+    td = env.reset()
 
-    # Main loop (stop with Ctrl+C; add n_iters if you want a finite run)
-    step = 0
-    for batch in collector:
-        step += 1
+    for it in range(1, total_iters + 1):
+        # Rollout storage
+        obs_buf = torch.zeros((rollout_T, n_agents, obs_dim), device=device)
+        mask_buf = torch.zeros((rollout_T, n_agents, n_actions), device=device, dtype=torch.bool)
+        act_buf = torch.zeros((rollout_T, n_agents), device=device, dtype=torch.int64)
+        logp_buf = torch.zeros((rollout_T, n_agents), device=device)
+        ent_buf = torch.zeros((rollout_T, n_agents), device=device)
+        done_buf = torch.zeros((rollout_T,), device=device, dtype=torch.bool)
+        rew_team_buf = torch.zeros((rollout_T,), device=device)
+        val_buf = torch.zeros((rollout_T,), device=device)
 
-        # Batch is a rollout TensorDict. You must:
-        # 1) compute value estimates with critic
-        # 2) compute advantages + value targets (GAE)
-        # 3) run PPO epochs over minibatches
+        # collect rollout
+        for t in range(rollout_T):
+            obs = td.get(("agents", "observation"))
+            mask = td.get(("agents", "action_mask"))
 
-        # ---- build critic inputs
-        obs_flat = _concat_obs(batch)
-        batch.set(("_global", "obs_flat"), obs_flat)
-        critic_td(batch)
+            obs_buf[t] = obs
+            mask_buf[t] = mask
 
-        # TODO: compute GAE (use TorchRL ValueEstimators.GAE or local compute_gae)
-        # For now, place-holders:
-        batch.set(("agents", "advantage"), torch.zeros_like(batch.get(("agents", "reward"))))
-        batch.set(("agents", "value_target"), torch.zeros_like(batch.get(("agents", "reward"))))
+            with torch.no_grad():
+                v_t = critic_value(obs)
+                action, logp, ent = policy_act(obs, mask)
 
-        # PPO epochs (placeholder; implement minibatching)
-        optim.zero_grad(set_to_none=True)
-        # Recompute new log_probs under current policy
-        policy(batch)
+            val_buf[t] = v_t
+            act_buf[t] = action
+            logp_buf[t] = logp
+            ent_buf[t] = ent
 
-        losses = loss_fn(
-            log_prob=batch.get(("agents", "sample_log_prob")),
-            old_log_prob=batch.get(("agents", "sample_log_prob")),  # TODO: store behavior logp before update
-            advantage=batch.get(("agents", "advantage")),
-            value_pred=batch.get(("_global", "state_value")),
-            value_target=batch.get(("agents", "value_target")),
-            entropy=batch.get(("agents", "entropy")) if batch.has(("agents", "entropy")) else None,
+            td.set(("agents", "action"), action)
+            td_step = env.step(td)
+
+            obs_next, mask_next, reward_next, done_next, td_next = _get_step_fields(td_step)
+
+            # reward_next: [A,1] -> team scalar
+            r_team = reward_next.mean().squeeze(-1)
+            rew_team_buf[t] = r_team
+
+            done_bool = bool(done_next.item())
+            done_buf[t] = torch.tensor(done_bool, device=device)
+
+            # advance
+            td = td_next
+            if done_bool:
+                td = env.reset()
+
+        # bootstrap
+        with torch.no_grad():
+            last_obs = td.get(("agents", "observation"))
+            last_value = critic_value(last_obs)
+
+        adv, ret = compute_gae(
+            rewards=rew_team_buf,
+            values=val_buf,
+            dones=done_buf,
+            last_value=last_value,
+            gamma=gamma,
+            lam=lam,
         )
-        losses["loss_total"].backward()
-        torch.nn.utils.clip_grad_norm_(list(actor_net.parameters()) + list(critic_net.parameters()), float(algo_cfg.get("max_grad_norm", 1.0)))
-        optim.step()
+        # normalize adv
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        if step % int(algo_cfg.get("log_every", 1)) == 0:
-            print({k: float(v.detach().cpu()) for k, v in losses.items()})
+        # PPO update
+        T = rollout_T
+        idx = torch.arange(T, device=device)
 
-        # TODO: evaluation, checkpointing, TensorBoard
+        losses_acc = {"loss_total": 0.0, "loss_pi": 0.0, "loss_v": 0.0, "entropy": 0.0}
+
+        for _epoch in range(ppo_epochs):
+            perm = idx[torch.randperm(T, generator=gen)]
+            for start in range(0, T, minibatch_size):
+                mb = perm[start : start + minibatch_size]
+                obs_mb = obs_buf.index_select(0, mb)        # [B, A, obs_dim]
+                mask_mb = mask_buf.index_select(0, mb)      # [B, A, n_actions]
+                act_mb = act_buf.index_select(0, mb)        # [B, A]
+                old_logp_mb = logp_buf.index_select(0, mb)  # [B, A]
+                adv_mb = adv.index_select(0, mb)            # [B]
+                ret_mb = ret.index_select(0, mb)            # [B]
+
+                # recompute logits for each timestep and role, then logp under current policy
+                B = obs_mb.shape[0]
+                logits_mb = torch.zeros((B, n_agents, n_actions), device=device)
+
+                if n_agv > 0:
+                    logits_agv = model.actor_agv(obs_mb[:, :n_agv, :].reshape(-1, obs_dim))
+                    logits_agv = logits_agv.view(B, n_agv, n_actions)
+                    logits_mb[:, :n_agv, :] = logits_agv
+
+                if n_picker > 0:
+                    logits_pick = model.actor_picker(obs_mb[:, n_agv:, :].reshape(-1, obs_dim))
+                    logits_pick = logits_pick.view(B, n_picker, n_actions)
+                    logits_mb[:, n_agv:, :] = logits_pick
+
+                logits_mb = _mask_logits(logits_mb, mask_mb)
+
+                dist = torch.distributions.Categorical(logits=logits_mb)
+                new_logp = dist.log_prob(act_mb)            # [B, A]
+                entropy = dist.entropy().mean()             # scalar
+
+                # team advantage broadcast to agents
+                adv_agents = adv_mb.view(B, 1).expand(B, n_agents)
+
+                ratio = torch.exp(new_logp - old_logp_mb)
+                surr1 = ratio * adv_agents
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_agents
+                loss_pi = -(torch.min(surr1, surr2)).mean()
+
+                # value loss (centralized critic)
+                obs_flat = obs_mb.reshape(B, -1)
+                v_pred = model.critic(obs_flat).squeeze(-1)  # [B]
+                loss_v = torch.mean((v_pred - ret_mb) ** 2)
+
+                loss_total = loss_pi + value_coef * loss_v - entropy_coef * entropy
+
+                optim.zero_grad(set_to_none=True)
+                loss_total.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.actor_agv.parameters())
+                    + list(model.actor_picker.parameters())
+                    + list(model.critic.parameters()),
+                    max_grad_norm,
+                )
+                optim.step()
+
+                losses_acc["loss_total"] += float(loss_total.detach().cpu())
+                losses_acc["loss_pi"] += float(loss_pi.detach().cpu())
+                losses_acc["loss_v"] += float(loss_v.detach().cpu())
+                losses_acc["entropy"] += float(entropy.detach().cpu())
+
+        # logging
+        if it % log_every == 0:
+            denom = max(1, (ppo_epochs * ((T + minibatch_size - 1) // minibatch_size)))
+            msg = {
+                "iter": it,
+                "team_reward_mean_rollout": float(rew_team_buf.mean().detach().cpu()),
+                "done_frac": float(done_buf.float().mean().detach().cpu()),
+                "loss_total": losses_acc["loss_total"] / denom,
+                "loss_pi": losses_acc["loss_pi"] / denom,
+                "loss_v": losses_acc["loss_v"] / denom,
+                "entropy": losses_acc["entropy"] / denom,
+            }
+            print(msg)
+
+        # TODO: checkpoint + eval hooks
+        if it % save_every == 0:
+            ckpt_path = ckpt_dir / f"iter_{it:06d}.pt"
+            torch.save(
+                {
+                    "iter": it,
+                    "actor_agv": model.actor_agv.state_dict(),
+                    "actor_picker": model.actor_picker.state_dict(),
+                    "critic": model.critic.state_dict(),
+                    "optim": optim.state_dict(),
+                    "env_cfg": env_cfg,
+                    "algo_cfg": algo_cfg,
+                },
+                ckpt_path,
+            )
+            torch.save({"path": str(ckpt_path)}, ckpt_dir / "latest.pt")
 
 
 if __name__ == "__main__":

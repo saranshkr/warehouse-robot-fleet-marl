@@ -21,7 +21,8 @@ Reward/terminated/truncated may be per-agent lists; we reduce to episode-level d
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, Optional, Sequence, Tuple, Union, Mapping
 
 import numpy as np
 import torch
@@ -43,6 +44,21 @@ def _bool_any(x: Any) -> bool:
         return bool(x)
     arr = np.asarray(x, dtype=bool)
     return bool(arr.any())
+
+
+
+def cfg_from_dict(d: Any) -> TARWareEnvConfig:
+    """Create TARWareEnvConfig from a dict (YAML) or return it if already TARWareEnvConfig."""
+    if isinstance(d, TARWareEnvConfig):
+        return d
+    if is_dataclass(d):
+        d = asdict(d)
+    if not isinstance(d, dict):
+        raise TypeError(f"cfg_from_dict expected dict or TARWareEnvConfig, got {type(d)}")
+
+    fields = set(TARWareEnvConfig.__dataclass_fields__.keys())  # type: ignore[attr-defined]
+    filtered = {k: v for k, v in d.items() if k in fields}
+    return TARWareEnvConfig(**filtered)
 
 
 @dataclass
@@ -68,6 +84,8 @@ class TARWareEnvConfig:
     # If None, infer maximum action count across agents and pad masks to that.
     n_actions: Optional[int] = None
 
+    debug: bool = False
+
 
 class TARWareTorchRLEnv(EnvBase):
     """TA-RWARE wrapper exposing TorchRL specs + TensorDict I/O.
@@ -83,6 +101,7 @@ class TARWareTorchRLEnv(EnvBase):
     def __init__(self, cfg: TARWareEnvConfig, device: Union[torch.device, str] = "cpu"):
         super().__init__(device=torch.device(device))
         self.cfg = cfg
+        self._debug = bool(cfg.debug)
 
         self._env = self._build_underlying_env(cfg)
 
@@ -106,24 +125,36 @@ class TARWareTorchRLEnv(EnvBase):
 
     # ----------------------- TorchRL required overrides -----------------------
 
-    def _reset(self, tensordict: Optional[TensorDict] = None) -> TensorDict:
+    def _reset(self, td: Optional[TensorDict] = None) -> TensorDict:
         seed = self.cfg.seed
-        if tensordict is not None and tensordict.get("seed", None) is not None:
-            seed = int(tensordict.get("seed").item())
+        if td is not None and td.get("seed", None) is not None:
+            seed = int(td.get("seed").item())
 
         obs, info = self._reset_underlying(seed=seed)
         obs_t = self._extract_obs(obs)
         mask_t = self._extract_action_mask(obs=obs, info=info)
 
-        if tensordict is None:
-            tensordict = TensorDict({}, batch_size=[], device=self.device)
+        if td is None:
+            td = TensorDict({}, batch_size=[], device=self.device)
         else:
-            tensordict = tensordict.empty()
+            td = td.empty()
 
-        tensordict.set(("agents", "observation"), obs_t)
-        tensordict.set(("agents", "action_mask"), mask_t)
-        tensordict.set("done", torch.zeros(1, dtype=torch.bool, device=self.device))
-        return tensordict
+        td.set(("agents", "observation"), obs_t)
+        td.set(("agents", "action_mask"), mask_t)
+        td.set("done", torch.zeros(1, dtype=torch.bool, device=self.device))
+
+        # zero-init stats so keys stay consistent across rollout stacking
+        zero = torch.zeros(1, dtype=torch.float32, device=self.device)
+        td.set(("stats", "shelf_deliveries"), zero.clone())
+        td.set(("stats", "clashes"), zero.clone())
+        td.set(("stats", "stucks"), zero.clone())
+        td.set(("stats", "vehicles_busy"), zero.clone())
+        td.set(("stats", "agvs_distance_travelled"), zero.clone())
+        td.set(("stats", "pickers_distance_travelled"), zero.clone())
+        td.set(("stats", "agvs_idle_time"), zero.clone())
+        td.set(("stats", "pickers_idle_time"), zero.clone())
+
+        return td
 
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
@@ -175,12 +206,46 @@ class TARWareTorchRLEnv(EnvBase):
 
         done_any = _bool_any(term_source) or _bool_any(trunc_source)
 
+        stats = {}
+
+        def _scalar(x, default=0.0, reduce="mean"):
+            """Convert env info values (scalar / list / np array) into a python float."""
+            if x is None:
+                return float(default)
+            arr = np.asarray(x)
+            if arr.size == 0:
+                return float(default)
+            if arr.dtype == object:
+                # handle list-of-lists etc.
+                arr = np.asarray([np.asarray(v).astype(np.float32).mean() for v in x], dtype=np.float32)
+
+            arr = arr.astype(np.float32, copy=False)
+            if arr.ndim == 0:
+                return float(arr)
+            if reduce == "sum":
+                return float(arr.sum())
+            return float(arr.mean())
+
+        
+        stats["shelf_deliveries"] = _scalar(info.get("shelf_deliveries", 0.0), reduce="sum")
+        stats["clashes"] = _scalar(info.get("clashes", 0.0), reduce="sum")
+        stats["stucks"] = _scalar(info.get("stucks", 0.0), reduce="sum")
+        stats["vehicles_busy"] = _scalar(info.get("vehicles_busy", 0.0), reduce="mean")
+
+        stats["agvs_distance_travelled"] = _scalar(info.get("agvs_distance_travelled", 0.0), reduce="sum")
+        stats["pickers_distance_travelled"] = _scalar(info.get("pickers_distance_travelled", 0.0), reduce="sum")
+        stats["agvs_idle_time"] = _scalar(info.get("agvs_idle_time", 0.0), reduce="sum")
+        stats["pickers_idle_time"] = _scalar(info.get("pickers_idle_time", 0.0), reduce="sum")
+
         # Outplace: overwrite contents
         out = tensordict.empty()
         out.set(("agents", "observation"), obs_t)
         out.set(("agents", "action_mask"), mask_t)
         out.set(("agents", "reward"), rew_t)
         out.set("done", torch.tensor([done_any], dtype=torch.bool, device=self.device))
+        for k, v in stats.items():
+            out.set(("stats", k), torch.tensor([v], dtype=torch.float32, device=self.device))
+
         return out
 
 
@@ -222,23 +287,25 @@ class TARWareTorchRLEnv(EnvBase):
     # ------------------------------ Specs ------------------------------------
 
     def _make_specs(self) -> None:
-        # Observations (NO done here)
         self.observation_spec = Composite(
             agents=Composite(
                 observation=Unbounded(
-                    shape=(self.n_agents, self.obs_dim),
-                    device=self.device,
-                    dtype=torch.float32,
+                    shape=(self.n_agents, self.obs_dim), device=self.device, dtype=torch.float32
                 ),
-                # action_mask is just a boolean tensor; Unbounded works fine here
                 action_mask=Unbounded(
-                    shape=(self.n_agents, self.n_actions),
-                    device=self.device,
-                    dtype=torch.bool,
+                    shape=(self.n_agents, self.n_actions), device=self.device, dtype=torch.bool
                 ),
-                device=self.device,
             ),
-            device=self.device,
+            stats=Composite(
+                shelf_deliveries=Unbounded(shape=(1,), device=self.device),
+                clashes=Unbounded(shape=(1,), device=self.device),
+                stucks=Unbounded(shape=(1,), device=self.device),
+                vehicles_busy=Unbounded(shape=(1,), device=self.device),
+                agvs_distance_travelled=Unbounded(shape=(1,), device=self.device),
+                pickers_distance_travelled=Unbounded(shape=(1,), device=self.device),
+                agvs_idle_time=Unbounded(shape=(1,), device=self.device),
+                pickers_idle_time=Unbounded(shape=(1,), device=self.device),
+            ),
         )
 
         # Discrete actions per agent
@@ -372,7 +439,7 @@ class TARWareTorchRLEnv(EnvBase):
         """
         if isinstance(obs, dict):
             # Unlikely for TA-RWARE, but support it anyway
-            keys = list(obs.keys())
+            keys = sorted(obs.keys())
             obs_list = [np.asarray(obs[k], dtype=np.float32).reshape(-1) for k in keys]
         elif isinstance(obs, (tuple, list)):
             obs_list = [np.asarray(o, dtype=np.float32).reshape(-1) for o in obs]
@@ -381,6 +448,9 @@ class TARWareTorchRLEnv(EnvBase):
             if arr.ndim == 1:
                 arr = arr[None, :]
             return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
+
+        if hasattr(self, "n_agents") and len(obs_list) != self.n_agents:
+            raise RuntimeError(f"Obs has {len(obs_list)} agents but wrapper expects {self.n_agents}.")
 
         n_agents = len(obs_list)
         max_dim = max(int(o.shape[0]) for o in obs_list)
@@ -408,9 +478,17 @@ class TARWareTorchRLEnv(EnvBase):
             "valid_actions_mask",
         ):
             if k in info:
-                m = np.asarray(info[k], dtype=bool)
+                m_raw = info[k]
+
+                # Handle list/tuple of per-agent masks cleanly (avoids dtype=object arrays)
+                if isinstance(m_raw, (list, tuple)) and len(m_raw) == self.n_agents:
+                    m = np.stack([np.asarray(x, dtype=bool).reshape(-1) for x in m_raw], axis=0)  # [A, K]
+                else:
+                    m = np.asarray(m_raw, dtype=bool)
+
                 if m.ndim == 1:
                     m = np.tile(m[None, :], (self.n_agents, 1))
+
                 mask = np.zeros((self.n_agents, self.n_actions), dtype=bool)
                 mask[:, : min(self.n_actions, m.shape[1])] = m[:, : self.n_actions]
                 return torch.as_tensor(mask, dtype=torch.bool, device=self.device)
@@ -419,7 +497,11 @@ class TARWareTorchRLEnv(EnvBase):
         for meth in ("get_action_mask", "get_action_masks", "action_masks", "get_avail_actions"):
             fn = getattr(self._env, meth, None)
             if callable(fn):
-                m = np.asarray(fn(), dtype=bool)
+                m_raw = fn()
+                if isinstance(m_raw, (list, tuple)) and len(m_raw) == self.n_agents:
+                    m = np.stack([np.asarray(x, dtype=bool).reshape(-1) for x in m_raw], axis=0)
+                else:
+                    m = np.asarray(m_raw, dtype=bool)
                 if m.ndim == 1:
                     m = np.tile(m[None, :], (self.n_agents, 1))
                 mask = np.zeros((self.n_agents, self.n_actions), dtype=bool)

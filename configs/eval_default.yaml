@@ -4,14 +4,20 @@ episodes_per_seed: 5
 # Scenario sweep for robustness
 sweep:
   - name: in_dist
+    layout: small
     n_agv: 2
     n_picker: 2
     order_rate: 1.0
+
   - name: more_robots
+    layout: small
     n_agv: 4
     n_picker: 4
     order_rate: 1.0
+
   - name: demand_burst
+    layout: small
+    max_steps: 500
     n_agv: 2
     n_picker: 2
     order_rate: 1.0
