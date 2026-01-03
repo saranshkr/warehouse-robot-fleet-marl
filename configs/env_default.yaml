@@ -25,3 +25,5 @@ burst:
 
 # Action space (macro actions)
 n_actions: null  # if null, infer/pad from env action_space
+
+debug: true

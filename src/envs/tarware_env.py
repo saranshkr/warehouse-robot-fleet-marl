@@ -84,6 +84,8 @@ class TARWareEnvConfig:
     # If None, infer maximum action count across agents and pad masks to that.
     n_actions: Optional[int] = None
 
+    debug: bool = False
+
 
 class TARWareTorchRLEnv(EnvBase):
     """TA-RWARE wrapper exposing TorchRL specs + TensorDict I/O.
@@ -99,6 +101,7 @@ class TARWareTorchRLEnv(EnvBase):
     def __init__(self, cfg: TARWareEnvConfig, device: Union[torch.device, str] = "cpu"):
         super().__init__(device=torch.device(device))
         self.cfg = cfg
+        self._debug = bool(cfg.debug)
 
         self._env = self._build_underlying_env(cfg)
 
@@ -122,24 +125,36 @@ class TARWareTorchRLEnv(EnvBase):
 
     # ----------------------- TorchRL required overrides -----------------------
 
-    def _reset(self, tensordict: Optional[TensorDict] = None) -> TensorDict:
+    def _reset(self, td: Optional[TensorDict] = None) -> TensorDict:
         seed = self.cfg.seed
-        if tensordict is not None and tensordict.get("seed", None) is not None:
-            seed = int(tensordict.get("seed").item())
+        if td is not None and td.get("seed", None) is not None:
+            seed = int(td.get("seed").item())
 
         obs, info = self._reset_underlying(seed=seed)
         obs_t = self._extract_obs(obs)
         mask_t = self._extract_action_mask(obs=obs, info=info)
 
-        if tensordict is None:
-            tensordict = TensorDict({}, batch_size=[], device=self.device)
+        if td is None:
+            td = TensorDict({}, batch_size=[], device=self.device)
         else:
-            tensordict = tensordict.empty()
+            td = td.empty()
 
-        tensordict.set(("agents", "observation"), obs_t)
-        tensordict.set(("agents", "action_mask"), mask_t)
-        tensordict.set("done", torch.zeros(1, dtype=torch.bool, device=self.device))
-        return tensordict
+        td.set(("agents", "observation"), obs_t)
+        td.set(("agents", "action_mask"), mask_t)
+        td.set("done", torch.zeros(1, dtype=torch.bool, device=self.device))
+
+        # zero-init stats so keys stay consistent across rollout stacking
+        zero = torch.zeros(1, dtype=torch.float32, device=self.device)
+        td.set(("stats", "shelf_deliveries"), zero.clone())
+        td.set(("stats", "clashes"), zero.clone())
+        td.set(("stats", "stucks"), zero.clone())
+        td.set(("stats", "vehicles_busy"), zero.clone())
+        td.set(("stats", "agvs_distance_travelled"), zero.clone())
+        td.set(("stats", "pickers_distance_travelled"), zero.clone())
+        td.set(("stats", "agvs_idle_time"), zero.clone())
+        td.set(("stats", "pickers_idle_time"), zero.clone())
+
+        return td
 
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
@@ -191,12 +206,46 @@ class TARWareTorchRLEnv(EnvBase):
 
         done_any = _bool_any(term_source) or _bool_any(trunc_source)
 
+        stats = {}
+
+        def _scalar(x, default=0.0, reduce="mean"):
+            """Convert env info values (scalar / list / np array) into a python float."""
+            if x is None:
+                return float(default)
+            arr = np.asarray(x)
+            if arr.size == 0:
+                return float(default)
+            if arr.dtype == object:
+                # handle list-of-lists etc.
+                arr = np.asarray([np.asarray(v).astype(np.float32).mean() for v in x], dtype=np.float32)
+
+            arr = arr.astype(np.float32, copy=False)
+            if arr.ndim == 0:
+                return float(arr)
+            if reduce == "sum":
+                return float(arr.sum())
+            return float(arr.mean())
+
+        
+        stats["shelf_deliveries"] = _scalar(info.get("shelf_deliveries", 0.0), reduce="sum")
+        stats["clashes"] = _scalar(info.get("clashes", 0.0), reduce="sum")
+        stats["stucks"] = _scalar(info.get("stucks", 0.0), reduce="sum")
+        stats["vehicles_busy"] = _scalar(info.get("vehicles_busy", 0.0), reduce="mean")
+
+        stats["agvs_distance_travelled"] = _scalar(info.get("agvs_distance_travelled", 0.0), reduce="sum")
+        stats["pickers_distance_travelled"] = _scalar(info.get("pickers_distance_travelled", 0.0), reduce="sum")
+        stats["agvs_idle_time"] = _scalar(info.get("agvs_idle_time", 0.0), reduce="sum")
+        stats["pickers_idle_time"] = _scalar(info.get("pickers_idle_time", 0.0), reduce="sum")
+
         # Outplace: overwrite contents
         out = tensordict.empty()
         out.set(("agents", "observation"), obs_t)
         out.set(("agents", "action_mask"), mask_t)
         out.set(("agents", "reward"), rew_t)
         out.set("done", torch.tensor([done_any], dtype=torch.bool, device=self.device))
+        for k, v in stats.items():
+            out.set(("stats", k), torch.tensor([v], dtype=torch.float32, device=self.device))
+
         return out
 
 
@@ -238,23 +287,25 @@ class TARWareTorchRLEnv(EnvBase):
     # ------------------------------ Specs ------------------------------------
 
     def _make_specs(self) -> None:
-        # Observations (NO done here)
         self.observation_spec = Composite(
             agents=Composite(
                 observation=Unbounded(
-                    shape=(self.n_agents, self.obs_dim),
-                    device=self.device,
-                    dtype=torch.float32,
+                    shape=(self.n_agents, self.obs_dim), device=self.device, dtype=torch.float32
                 ),
-                # action_mask is just a boolean tensor; Unbounded works fine here
                 action_mask=Unbounded(
-                    shape=(self.n_agents, self.n_actions),
-                    device=self.device,
-                    dtype=torch.bool,
+                    shape=(self.n_agents, self.n_actions), device=self.device, dtype=torch.bool
                 ),
-                device=self.device,
             ),
-            device=self.device,
+            stats=Composite(
+                shelf_deliveries=Unbounded(shape=(1,), device=self.device),
+                clashes=Unbounded(shape=(1,), device=self.device),
+                stucks=Unbounded(shape=(1,), device=self.device),
+                vehicles_busy=Unbounded(shape=(1,), device=self.device),
+                agvs_distance_travelled=Unbounded(shape=(1,), device=self.device),
+                pickers_distance_travelled=Unbounded(shape=(1,), device=self.device),
+                agvs_idle_time=Unbounded(shape=(1,), device=self.device),
+                pickers_idle_time=Unbounded(shape=(1,), device=self.device),
+            ),
         )
 
         # Discrete actions per agent

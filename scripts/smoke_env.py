@@ -72,26 +72,26 @@ def main() -> None:
 
     while not done and steps < max_steps:
         mask = td.get(("agents", "action_mask"))
-        actions = random_valid_actions(mask)  # should return int64 [n_agents] on same device
+        actions = random_valid_actions(mask)
         td.set(("agents", "action"), actions)
 
         td = env.step(td)
+        td = td.get("next", td)  # advance state (TorchRL style)
 
-        if td.get(("next", "agents", "reward")) is not None:
-            r = td.get(("next", "agents", "reward"))
-            done = bool(td.get(("next", "done")).item())
-            td = td.get("next")  # advance state
-        else:
-            r = td.get(("agents", "reward"))
-            done = bool(td.get("done").item())
-
+        r = td.get(("agents", "reward"))  # [n_agents, 1]
         total_reward += float(r.mean().item())
         steps += 1
-
-        # r = td.get(("agents", "reward"))  # [n_agents, 1]
-        # total_reward += float(r.mean().item())
-        # steps += 1
         done = bool(td.get("done").item())
+
+        # ---- debug stats print (every 50 steps)
+        d = td.get(("stats", "shelf_deliveries"), None)
+        if d is not None and steps % 50 == 0:
+            deliveries = float(d.item())
+            clashes_t = td.get(("stats", "clashes"), None)
+            stucks_t = td.get(("stats", "stucks"), None)
+            clashes = float(clashes_t.item()) if clashes_t is not None else 0.0
+            stucks = float(stucks_t.item()) if stucks_t is not None else 0.0
+            print(f"step={steps} deliveries={deliveries} clashes={clashes} stucks={stucks}")
 
     env.close()
 
