@@ -22,6 +22,6 @@ entropy_coef: 0.01
 value_coef: 0.5
 
 # Run control
-iters: 2000
+iters: 50
 log_every: 1
 save_every: 50

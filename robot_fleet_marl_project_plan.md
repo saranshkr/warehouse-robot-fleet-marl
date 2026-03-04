@@ -1,249 +1,201 @@
-# TA-RWARE Robot Fleet Orchestration with Multi-Agent Reinforcement Learning (MARL)
-*A reusable, end-to-end project plan optimized for “senior” signals on a resume + GitHub.*
+# TA‑RWARE Multi‑Agent Task Assignment (TorchRL MAPPO)
+
+## 0) Project snapshot
+**Goal:** Train and evaluate a Multi‑Agent PPO variant (MAPPO, CTDE) on **TA‑RWARE** (Task Assignment Robotic Warehouse), demonstrating improved warehouse throughput/efficiency vs dispatch baselines (random + heuristic + OR‑style matching), with robust evaluation and strong portfolio‑grade artifacts.
+
+**Core deliverables:**
+- A TorchRL‑compatible environment wrapper (action masking, per‑agent obs, stats)
+- MAPPO training script (reproducible, checkpointed)
+- Evaluation harness across **seeds** + **scenario sweeps**
+- Baselines (random + heuristic; optional greedy/Hungarian)
+- Clear metrics + plots + demo replay
 
 ---
 
-## 0) One-sentence pitch (use everywhere)
-Build a **multi-agent fleet orchestration system** for warehouse automation where heterogeneous robots coordinate **task assignment** to maximize **pick rate / throughput** while minimizing **idle time, congestion, and delay**, with a **reproducible training pipeline**, rigorous baselines (heuristics + OR), and a **replay dashboard**.
+## Progress so far (current repo status)
+**Repo & workflow**
+- [x] Created repo and committed foundational files to `main`
+- [x] Created development branch: `feature/mappo-training`
+- [x] TA‑RWARE installed in editable mode (cloned repo + `pip install -e .`) and import works
 
-> **Why TA-RWARE (vs RWARE)?** TA-RWARE focuses on **macro decision-making**: agents choose **target locations / tasks**, while low-level traversal is handled by a **predefined pathfinding heuristic** (e.g., A*). This makes the project read like real dispatch/orchestration (MRTA), and typically reduces training pain vs learning navigation end-to-end.
+**Environment integration**
+- [x] Implemented `TARWareTorchRLEnv` (TorchRL `EnvBase`) wrapper
+- [x] Added Gymnasium compatibility wrapper around TA‑RWARE to avoid checker warnings (reset returns `(obs, info)`, step returns scalar reward/booleans while preserving per‑agent lists in `info`)
+- [x] Added robust `_extract_obs` and `_extract_action_mask`
+- [x] Fixed spec/key issues (done keys, deprecated spec classes) and got `check_env_specs` passing
+- [x] Added basic `stats` extraction from TA‑RWARE `info` (deliveries, clashes, stucks, utilization, distance, idle time)
 
----
+**Debug & diagnostics**
+- [x] `scripts/smoke_env.py` runs multi‑seed × multi‑episode random rollouts and prints periodic stats
+- [x] Confirmed event reward signal can be **positive** on rare events (per‑agent reward spikes; deliveries sometimes increment)
+- [x] Confirmed action mask dtype/shape correctness in resets
 
-## 1) Goals and “seniority signals”
-### Primary goals
-1. **Coordination**: heterogeneous agents learn to coordinate assignments and timing (who does what, when).
-2. **Operational performance**: maximize **pick rate** (fulfilled order lines per unit time/steps) and minimize order latency.
-3. **Reliability**: robust to demand spikes, partial observability/noise, agent failures, and distribution shift (more robots, larger layouts).
-4. **Reproducibility**: deterministic runs, experiment tracking, Dockerized execution.
-5. **Interpretability** (optional): explain coordination quality (utilization, fairness, congestion, reassignment behavior).
+**Training & evaluation scaffolding**
+- [x] `scripts/train.py` exists and runs MAPPO‑style rollout + PPO update loop
+- [x] `configs/mappo_default.yaml` exists (seed, rollout, PPO/GAE, logging, checkpoint cadence)
+- [x] Checkpoint saving wired (iter checkpoints + latest pointer)
+- [x] `scripts/eval.py` harness exists (loads saved policy and runs rollouts)
+- [ ] Evaluation outputs + plots still to be formalized (mean±std tables, robustness curves)
 
-### What will read as “senior” on GitHub/resume
-- Clean **system design**: env wrappers + training + evaluation + replay + export.
-- **Baselines + ablations**: include both heuristic and optimization-style baselines.
-- **Stress/robustness tests**: failure injection + demand bursts + delayed observations.
-- **Operational KPIs**: pick rate, latency, utilization, congestion, fairness—not just reward.
-- **Deployable artifact**: replay viewer + exportable policy (TorchScript/ONNX) + simple inference API (optional).
-- **Failure analysis**: a short “what failed / why” section with examples.
-
----
-
-## 2) TA-RWARE concept mapping (domain clarity)
-### Key terms
-- **Pick**: an order line (item request) that becomes **fulfilled** (e.g., delivered/processed at an output/packing station).
-- **Pick rate**: picks per unit time. Report as:
-  - `picks / episode`
-  - `picks / 1,000 steps`
-  - (optional) `picks / minute` if you simulate wall-clock.
-
-### What changes vs RWARE
-- Your policy controls **assignment decisions** (macro actions), not low-level navigation.
-- Movement is handled by a deterministic heuristic → demos are best when paired with **metric overlays** (cumulative picks, utilization, queueing).
+**Known current issues (to address next)**
+- [ ] Training appears to converge to low‑entropy behavior without improving deliveries (deliveries often remain 0)
+- [ ] Need a stronger diagnostic for whether the policy sees enough learning signal (reward shaping / longer horizon / baseline comparisons)
+- [ ] Need to verify/standardize episode length handling (TA‑RWARE may have a built‑in termination around 500 steps in your current env IDs)
 
 ---
 
-## 3) Project deliverables (what you’ll ship)
-### Must-have (portfolio-grade)
-1. **GitHub repo** with:
-   - reproducible training scripts
-   - evaluation harness + metrics
-   - baseline implementations (heuristic + OR + ML baseline)
-   - replay generation utilities
-2. **Demo assets**
-   - 30–60s highlight video (baseline vs MARL side-by-side)
-   - 3–5 GIFs for README
-3. **Replay dashboard (Streamlit recommended)**
-   - scenario selection
-   - policy selection
-   - replay + KPI overlays
-4. **Policy export**
-   - TorchScript or ONNX export + inference snippet
-5. **Short technical report** (Markdown)
-   - experimental setup, results table, ablations, stress tests, failure analysis
+## 1) Problem framing (for README + demo)
+### What TA‑RWARE is (and what it isn’t)
+- TA‑RWARE is primarily a **task assignment / dispatch** environment.
+- Robot motion is typically handled by built‑in routing/heuristics; learning focuses on **which agent does which job, and when**.
 
-### Nice-to-have
-- Simple inference API (FastAPI) for “dispatch” endpoints
-- Docker image for training + demo
-- CI (lint/tests) + minimal unit tests for wrappers/metrics
+### What you’ll optimize
+Pick 2–4 primary KPIs:
+- **Pick/Delivery throughput**: items delivered per time (or per episode)
+- **Pick rate**: deliveries per step (or per minute)
+- **Order latency**: time from order arrival to completion (p50/p95)
+- **Utilization**: fraction of time robots are busy vs idle
+- Optional: congestion proxy (clashes/stucks), travel distance
 
 ---
 
-## 4) Metrics (what you log and show)
-### Core operational metrics (TA-RWARE friendly)
-- **Pick rate / throughput**
-  - picks per episode
-  - picks per 1,000 steps
-- **Mean order completion time** (latency)
-- **Idle time %** per agent role (AGV vs picker)
-- **Empty travel ratio**: distance traveled without carrying / without progress
-- **Queueing metrics**
-  - avg/max queue length at stations
-  - time in queue
-- **Congestion**
-  - bottleneck occupancy
-  - average “blocked waiting” time (agents stuck due to others)
-- **Fairness / balance**
-  - work done per agent
-  - optional Gini coefficient over work distribution
+## 2) Key modeling choice: CTDE MAPPO
+### Why MAPPO here
+- Agents are partially observed and coordination is required
+- Centralized critic stabilizes learning
+- Decentralized actors remain deployable (each agent acts on its own obs)
 
-### ML/training stability metrics
-- reward curve (train/eval)
-- entropy (exploration)
-- value loss / policy loss
-- gradient norms
+### Role heterogeneity (AGV vs Picker)
+Two common approaches:
+1. **Separate actors per role** (agv actor + picker actor)
+2. **Single shared actor + role embedding**
 
-### Robustness metrics (report curves)
-- pick rate vs number of robots
-- pick rate vs demand burst severity
-- pick rate vs observation noise / dropout
-- pick rate vs action delay
-- pick rate vs robot failure rate
+Start with (1) for stability, then optionally move to (2) to reduce params.
 
 ---
 
-## 5) Baselines (crucial for credibility in TA-RWARE)
-You want baselines that match macro-action task assignment, since traversal is heuristic.
+## 3) Environment wrapper contract (TorchRL)
+### Required outputs per step
+Your TorchRL env wrapper should emit (at minimum):
+- `("agents","observation")`: float32 tensor `[n_agents, obs_dim]`
+- `("agents","action_mask")`: bool tensor `[n_agents, n_actions]` (True = valid)
+- `("agents","reward")`: float32 tensor `[n_agents, 1]` (or team reward broadcast)
+- `"done"`: bool tensor `[1]`
+- Optional diagnostic signals:
+  - `("stats","shelf_deliveries")`, `("stats","vehicles_busy")`, etc.
 
-### Minimum recommended set (strong and fair)
-1. **Built-in TA-RWARE heuristic (FIFO/greedy dispatcher)**
-   - Use the env/repo-provided default policy if available (document it).
-2. **Random valid target selection**
-   - Random among valid targets; include action masking.
-3. **Greedy cost-based assignment**
-   - Score tasks by estimated travel time + queue penalty + congestion penalty.
-4. **Min-cost matching (Hungarian) baseline**
-   - Model assignment as bipartite matching (robots ↔ tasks or robot-pairs ↔ tasks).
-5. **Independent learners (no CTDE)**
-   - Per-role PPO (or shared params) **without centralized critic**.
-
-### Why these matter
-- (1) is the “everyone must beat this” baseline.
-- (4) signals “I know OR / dispatch algorithms,” which reads senior.
+### Episode termination
+Ensure wrapper consistently sets:
+- `done=True` when environment terminates
+- (optional) `terminated` / `truncated` if you want Gymnasium‑style separation
 
 ---
 
-## 6) Main algorithm plan (what to build and why)
+## 4) Baselines (must have)
+At least 2 baselines are expected; 3–4 is ideal.
 
-### Recommended training algorithm (decision)
-**Use MAPPO (CTDE) as the primary algorithm.** It is a strong, widely used cooperative MARL baseline for discrete/partially-observed settings and fits TA‑RWARE’s “dispatch/task assignment” nature.
+### Minimum baselines
+1. **Random valid action** (already implemented)
+2. **Heuristic dispatcher** from TA‑RWARE repo (if exposed)
 
-**Why MAPPO here**
-- **CTDE**: decentralized actors (deployable) + centralized critic (stabilizes multi-agent learning).
-- **Heterogeneous roles**: naturally supported via either separate role policies or a role-conditioned shared policy.
-- **Action masking friendly**: TA‑RWARE typically benefits from masking invalid targets; MAPPO works well with masks.
-
-**Implementation defaults (keep it simple)**
-- Start with **two actors (one per role)** + **one centralized critic** (or 1 shared actor + role embedding).
-- Critic input (v1): **concatenate all agents’ observations** (works even if the env doesn’t expose a special “global state”).
-- Add **action masking** from day 1. Consider **top‑K candidate reduction** (e.g., nearest K targets) if the action space is very large.
-
-### Baseline RL algorithms (for credible comparisons)
-Include at least one “ML baseline” besides your main MAPPO:
-
-1) **IPPO (Independent PPO)** — *no centralized critic*  
-   - Same PPO code, but each agent learns independently (or shared parameters) with **local critic inputs only**.  
-   - This cleanly shows the value of CTDE.
-
-2) **QMIX / VDN (optional, strong second family)**  
-   - Value-decomposition methods often perform well on cooperative discrete tasks.  
-   - Use only if you want an extra comparison line; it adds implementation/tuning work.
-
-> Recommendation: Ship with **MAPPO + IPPO** first. Add **QMIX** later only if you have time and want a second algorithm family in the report.
-
-
-### Recommended mainline: MAPPO (CTDE) adapted for TA-RWARE
-Why:
-- strong default for cooperative tasks and partial observability
-- centralized critic helps resolve coordination
-
-**Key TA-RWARE implementation choices**
-- **Heterogeneous roles**:
-  - Option A: separate actors per role (AGV policy + picker policy)
-  - Option B: single shared actor + **role embedding** + agent ID embedding
-- **Centralized critic**:
-  - input: concatenated per-agent observations (and/or global state if exposed)
-  - output: value estimate for joint state
-- **Recurrent policy** (optional):
-  - GRU to help with partial observability and dynamic queues
-
-### Alternative algorithms (optional comparative)
-- **QMIX / VDN**: value factorization; strong for cooperative discrete macro actions.
-- **Hierarchical / manager-worker** (stretch): manager assigns tasks; workers execute.
-
-### Reward design (be explicit + ablate)
-Use a reward aligned with warehouse KPIs:
-- +R_pick per fulfilled pick
-- −c_delay per step (or per unfulfilled order)
-- −c_idle for idle time (role-specific)
-- −c_congestion for blocked waiting / bottleneck occupancy
-- −c_reassign for excessive reassignment thrash (optional)
-
-**Ablations:** remove congestion penalty / idle penalty / reassignment penalty and show impact.
+### Strong baselines (high value)
+3. **Greedy assignment**
+   - assign available jobs to nearest eligible robot
+4. **Hungarian / min‑cost matching**
+   - cost = travel distance + congestion/idle penalties
 
 ---
 
-## 7) Environment engineering (senior signal: clean wrappers + reproducibility)
-### Wrapper responsibilities
-- Standardize observation tensor shapes:
-  - per-role grouping if needed
-  - output: `obs: Dict[role, Tensor[num_agents_role, obs_dim]]` or a padded tensor
-- Action tensors per role:
-  - `actions_agv: [n_agv]`, `actions_picker: [n_picker]`
-- Add:
-  - action masking for invalid targets
-  - conversion utilities between env dict I/O and tensors
-- Provide:
-  - `reset(seed) -> obs, info`
-  - `step(actions) -> obs, rewards, done, truncated, info`
+## 5) Reward design & learning signal
+### What to confirm early
+- Does the environment reward deliver/pick events strongly enough?
+- Is there a dense shaping signal (e.g., +0.1 for sub‑task progress) or is it sparse?
+- Are episodes long enough for random to ever succeed?
 
-### Scenario generator (evaluation is everything)
-Parameterize:
-- layout size / topology
-- number of AGVs and pickers
-- station count / capacity
-- order arrival rate (including bursty distributions)
-- obstacle/bottleneck settings if supported
-
-### Determinism checklist
-- seed Python, NumPy, torch
-- seed env reset
-- log all config in run folder
-- record env version/commit and dependency versions
+### If reward is too sparse
+Consider:
+- Extending horizon (if possible)
+- Using curriculum (small layouts, fewer robots)
+- Reward shaping (distance, queue reduction, avoid stuck/clash)
 
 ---
 
-## 8) Training pipeline (MLOps vibe)
-### Experiment structure
-- `configs/` (YAML): env + algo + training
-- `train.py`: reads config, launches training, writes artifacts
-- `eval.py`: batch evaluation across seeds + scenarios
-- `sweep.py`: optional grid search runner
-- `replay.py`: generate GIF/MP4 for episodes
+## 6) MAPPO training pipeline (end‑to‑end)
+### Data collection
+- On‑policy rollout for `T` steps
+- Store for each timestep:
+  - obs, action, mask
+  - logp(action)
+  - reward (team or per agent)
+  - done
+  - value estimate V(s)
 
-### Logging & tracking
-Minimum:
-- TensorBoard for losses + KPIs
-- `results.json` with final evaluation summary
-Recommended:
-- produce a `report.md` artifact per run with plots + tables
+### Advantage estimation
+- Compute **GAE(λ)** with `(gamma, lambda)`
+- Normalize advantages per batch
 
-### Evaluation protocol (do not skip)
+### PPO update
+- For K epochs:
+  - shuffle timesteps into minibatches
+  - recompute logp under current policy
+  - compute ratio and clipped surrogate objective
+  - update centralized critic on value targets
+  - add entropy bonus
+
+### Checkpointing
+- Save every `save_every` iterations:
+  - actor(s), critic, optimizer, config, iter
+- Maintain `latest.pt` pointer
+
+---
+
+## 7) Evaluation harness (do not skip)
+### What evaluation must answer
+- Does MAPPO beat baselines on **throughput** and/or **latency**?
+- Is performance consistent across **seeds**?
+- Does it generalize to scenario changes?
+
+### Standard evaluation protocol
 - Train with N seeds (e.g., 3)
-- Evaluate:
-  - in-distribution layouts
-  - out-of-distribution: more robots, different layouts, higher order rates
-- Report mean ± std for pick rate, latency, utilization, congestion
+- Evaluate with M seeds (e.g., 5) and report mean ± std
+- Scenario sweep:
+  - in‑distribution layout/config
+  - more robots
+  - higher order rate
+  - demand burst
+
+### Reported metrics
+- total deliveries (per episode)
+- pick rate (deliveries / steps)
+- mean reward (team)
+- utilization proxy (vehicles_busy)
+- collisions/stucks
 
 ---
 
-## 9) Stress tests / robustness (highly impressive, TA-RWARE-friendly)
-Because TA-RWARE doesn’t learn routing, focus disruptions on dispatch realism:
+## 8) Artifacts & reporting (portfolio quality)
+### Must‑have artifacts
+- `README.md` with quickstart + results table
+- `results.json` / `eval_results.json`
+- Plots:
+  - deliveries over time
+  - pick rate vs scenario
+  - reward curves
+
+### Recommended artifacts
+- `report.md` per run: configs + plots + summary table
+- Short demo video with overlays
+
+---
+
+## 9) Stress tests / robustness (highly impressive, TA‑RWARE‑friendly)
+Because TA‑RWARE doesn’t learn routing, focus disruptions on dispatch realism:
 
 ### Stress tests
 1. **Demand bursts**
    - spike order arrival for a window of time
 2. **Robot failure**
-   - freeze/remove a robot mid-episode; measure recovery
+   - freeze/remove a robot mid‑episode; measure recovery
 3. **Observation noise/dropout**
    - corrupt queue lengths or task availability signals
 4. **Action delay**
@@ -256,7 +208,7 @@ Because TA-RWARE doesn’t learn routing, focus disruptions on dispatch realism:
 ### Robustness scoring
 - Plot pick rate vs severity level
 - Plot latency tail (p95) vs severity
-- Summarize as area-under-curve or worst-case performance
+- Summarize as area‑under‑curve or worst‑case performance
 
 ---
 
@@ -286,7 +238,7 @@ Run 4–6 focused ablations:
 
 ---
 
-## 12) Deployment & demo plan (how to make TA-RWARE demos pop)
+## 12) Deployment & demo plan (how to make TA‑RWARE demos pop)
 Because traversal is heuristic, you must overlay metrics.
 
 ### A) Demo video storyboard (60 seconds)
@@ -383,12 +335,12 @@ ta-rware-marl/
 
 ## 14) Milestones (practical build order)
 ### Phase 1: Foundations (get to a replay fast)
-- Setup TA-RWARE env + wrapper (roles + action masking)
+- Setup TA‑RWARE env + wrapper (roles + action masking)
 - Implement heuristic baseline + random baseline
 - Build replay renderer (GIF/MP4) with KPI overlay (cumulative picks)
 
 ### Phase 2: MARL v1 (working training)
-- Implement MAPPO for heterogeneous roles (separate actors or role-embedded actor)
+- Implement MAPPO for heterogeneous roles (separate actors or role‑embedded actor)
 - Train on small layouts and confirm learning signal
 - Add evaluation script (mean/std across seeds)
 
@@ -408,7 +360,7 @@ ta-rware-marl/
 ---
 
 ## 15) README checklist (what to include)
-- 6-line overview + gif
+- 6‑line overview + gif
 - “Why this matters” (throughput/pick rate, latency, utilization)
 - Quickstart (train/eval/demo)
 - Baselines and metrics explained (include OR baseline)
@@ -421,8 +373,8 @@ ta-rware-marl/
 
 ## 16) Resume bullet template (save for later)
 Use 2–3 bullets like:
-- Built a multi-agent **task assignment/orchestration** system for heterogeneous warehouse robots, improving **pick rate by X%** and reducing **p95 order latency by Y%** vs FIFO and min-cost matching baselines across N layouts.
-- Implemented **CTDE MAPPO** with role-conditioned policies and a reproducible evaluation harness featuring **stress tests** (demand bursts, robot failures, delayed observations) and robustness curves.
+- Built a multi‑agent **task assignment/orchestration** system for heterogeneous warehouse robots, improving **pick rate by X%** and reducing **p95 order latency by Y%** vs FIFO and min‑cost matching baselines across N layouts.
+- Implemented **CTDE MAPPO** with role‑conditioned policies and a reproducible evaluation harness featuring **stress tests** (demand bursts, robot failures, delayed observations) and robustness curves.
 - Shipped a **Streamlit replay dashboard** with KPI overlays and an exportable **TorchScript/ONNX policy** for fast inference and reproducible demos (Dockerized).
 
 ---
@@ -430,9 +382,9 @@ Use 2–3 bullets like:
 ## 17) Optional stretch ideas (if you want “wow”)
 - Curriculum learning (low demand → bursty demand; small → large layouts)
 - Graph neural network critic (model spatial/role relations)
-- Multi-objective optimization (Pareto: pick rate vs congestion vs fairness)
-- Offline RL or imitation warm-start using heuristic trajectories
-- Uncertainty-aware dispatch under noisy queue signals
+- Multi‑objective optimization (Pareto: pick rate vs congestion vs fairness)
+- Offline RL or imitation warm‑start using heuristic trajectories
+- Uncertainty‑aware dispatch under noisy queue signals
 
 ---
 
@@ -446,4 +398,14 @@ You are done when you can say:
 
 ---
 
-*Keep this as the master plan; prune later once scope is locked.*
+## Next actions (recommended order)
+1. **Confirm episode horizon behavior** for your chosen env ID(s) (why it terminates at ~500) and decide whether to keep it or extend it.
+2. **Baseline benchmarking**: run heuristic (and/or greedy) baseline to establish a non‑zero deliveries target.
+3. **Training signal audit**:
+   - verify deliveries happen in baseline runs
+   - confirm reward correlates with deliveries
+4. **Upgrade evaluation**: write `eval_results.json` + summary table (mean±std)
+5. **Add one strong OR baseline** (Hungarian) and one stress test (demand burst)
+
+*Keep this as the master plan; update progress boxes as you implement each phase.*
+

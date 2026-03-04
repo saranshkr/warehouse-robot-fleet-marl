@@ -170,6 +170,24 @@ class TARWareTorchRLEnv(EnvBase):
             terminated, truncated = done, False
         else:
             raise RuntimeError(f"Unexpected env.step output length: {len(step_out)}")
+        
+        # ---- reward source sanity (debug)
+        r_scalar = reward  # what Gym returned (scalar float)
+        r_pa = info.get("reward_per_agent", None)
+
+        if self._debug and r_pa is not None:
+            r_pa_mean = float(np.asarray(r_pa, dtype=np.float32).mean())
+            if abs(float(r_scalar) - r_pa_mean) > 1e-6:
+                print(
+                    f"[reward-mismatch] scalar={float(r_scalar):.6f} "
+                    f"mean(reward_per_agent)={r_pa_mean:.6f}"
+                )
+
+        # if getattr(self, "_debug", True):
+        #     self._debug = False
+        #     print("[tarware info sample]", {k: type(v) for k, v in info.items()})
+        #     print("[tarware shelf_deliveries raw]", info.get("shelf_deliveries"))
+        #     print("[tarware reward_per_agent raw]", info.get("reward_per_agent"))
 
         obs_t = self._extract_obs(obs)
         mask_t = self._extract_action_mask(obs=obs, info=info if isinstance(info, dict) else {})
@@ -356,7 +374,11 @@ class TARWareTorchRLEnv(EnvBase):
 
         # optional: disables Gymnasium's passive checker entirely (extra safety)
         # but we won't rely on this alone — we also wrap to be compliant.
-        env = gym.make(env_id, disable_env_checker=True)
+        env = gym.make(
+            env_id,
+            disable_env_checker=True,
+            max_episode_steps=int(cfg.max_steps) if cfg.max_steps is not None else None,
+        )
 
         class _TarwareGymnasiumCompat(gym.Wrapper):
             """Convert TA-RWARE multi-agent signals into Gymnasium-compatible scalars.
@@ -394,12 +416,12 @@ class TARWareTorchRLEnv(EnvBase):
         env = _TarwareGymnasiumCompat(env)
 
         # Optional TimeLimit
-        try:
-            from gymnasium.wrappers import TimeLimit
-            if cfg.max_steps is not None and getattr(env, "_max_episode_steps", None) is None:
-                env = TimeLimit(env, max_episode_steps=int(cfg.max_steps))
-        except Exception:
-            pass
+        # try:
+        #     from gymnasium.wrappers import TimeLimit
+        #     if cfg.max_steps is not None and getattr(env, "_max_episode_steps", None) is None:
+        #         env = TimeLimit(env, max_episode_steps=int(cfg.max_steps))
+        # except Exception:
+        #     pass
 
         return env
 

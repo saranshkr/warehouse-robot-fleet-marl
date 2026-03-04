@@ -56,6 +56,17 @@ def _get_step_fields(td):
     )
 
 
+def _td_scalar(td, key, default=0.0, device=None):
+    """Fetch td[key] as float32 scalar tensor (shape [1]) with a default if missing."""
+    v = td.get(key, None)
+    if v is None:
+        return torch.tensor([default], dtype=torch.float32, device=device)
+    if not torch.is_tensor(v):
+        v = torch.as_tensor(v, dtype=torch.float32, device=device)
+    v = v.to(dtype=torch.float32, device=device).reshape(-1)[:1]  # [1]
+    return v
+
+
 def _mask_logits(logits, mask):
     # mask: True means valid
     return logits.masked_fill(~mask, -1e9)
@@ -225,6 +236,18 @@ def main() -> None:
         rew_team_buf = torch.zeros((rollout_T,), device=device)
         val_buf = torch.zeros((rollout_T,), device=device)
 
+        stats_keys = [
+            "shelf_deliveries",
+            "clashes",
+            "stucks",
+            "vehicles_busy",
+            "agvs_distance_travelled",
+            "pickers_distance_travelled",
+            "agvs_idle_time",
+            "pickers_idle_time",
+        ]
+        stats_buf = {k: torch.zeros((rollout_T,), dtype=torch.float32, device=device) for k in stats_keys}
+
         # collect rollout
         for t in range(rollout_T):
             obs = td.get(("agents", "observation"))
@@ -246,13 +269,37 @@ def main() -> None:
             td_step = env.step(td)
 
             obs_next, mask_next, reward_next, done_next, td_next = _get_step_fields(td_step)
+            # record stats from next-state td (your env wrapper puts them at root: ("stats", key))
+            for k in stats_keys:
+                stats_buf[k][t] = _td_scalar(td_next, ("stats", k), default=0.0, device=device).squeeze(0)
+
+            # ---- Diagnostic: detect reward spikes or delivery increments
+            # (prints very rarely; safe to leave on temporarily)
+            r_mean = float(reward_next.mean().item())
+
+            d = td_next.get(("stats", "shelf_deliveries"), None)
+            d_val = float(d.item()) if d is not None else 0.0
+
+            if (r_mean > -0.0005) or (d_val > 0.0):
+                # per-agent reward at this step (from reward_next tensor)
+                r_pa = reward_next.squeeze(-1).detach().cpu().tolist()
+
+                busy = float(_td_scalar(td_next, ("stats", "vehicles_busy"), 0.0, device=device).item())
+                stucks = float(_td_scalar(td_next, ("stats", "stucks"), 0.0, device=device).item())
+                clashes = float(_td_scalar(td_next, ("stats", "clashes"), 0.0, device=device).item())
+
+                print(
+                    f"[event] it={it} t={t} r_mean={r_mean:.6f} r_pa={r_pa} "
+                    f"deliveries={d_val} busy={busy:.3f} stucks={stucks} clashes={clashes} "
+                    f"done={bool(done_next.item())}"
+                )
 
             # reward_next: [A,1] -> team scalar
-            r_team = reward_next.mean().squeeze(-1)
-            rew_team_buf[t] = r_team
+            # r_team = reward_next.mean().squeeze(-1)
+            rew_team_buf[t] = reward_next.mean()
 
             done_bool = bool(done_next.item())
-            done_buf[t] = torch.tensor(done_bool, device=device)
+            done_buf[t] = done_bool
 
             # advance
             td = td_next
@@ -343,18 +390,34 @@ def main() -> None:
                 losses_acc["entropy"] += float(entropy.detach().cpu())
 
         # logging
-        if it % log_every == 0:
-            denom = max(1, (ppo_epochs * ((T + minibatch_size - 1) // minibatch_size)))
-            msg = {
-                "iter": it,
-                "team_reward_mean_rollout": float(rew_team_buf.mean().detach().cpu()),
-                "done_frac": float(done_buf.float().mean().detach().cpu()),
-                "loss_total": losses_acc["loss_total"] / denom,
-                "loss_pi": losses_acc["loss_pi"] / denom,
-                "loss_v": losses_acc["loss_v"] / denom,
-                "entropy": losses_acc["entropy"] / denom,
-            }
-            print(msg)
+        # if it % log_every == 0:
+        #     denom = max(1, (ppo_epochs * ((T + minibatch_size - 1) // minibatch_size)))
+        #     deliveries = stats_buf["shelf_deliveries"]                 # [T]
+        #     deliveries_last = float(deliveries[-1].detach().cpu())
+        #     deliveries_sum = float(deliveries.sum().detach().cpu())
+
+        #     # If shelf_deliveries is cumulative, delta-sum ~= number of new deliveries
+        #     deliveries_delta_sum = float(
+        #         torch.clamp(deliveries[1:] - deliveries[:-1], min=0.0).sum().detach().cpu()
+        #     )
+
+        #     stucks_mean = float(stats_buf["stucks"].mean().detach().cpu())
+        #     busy_mean = float(stats_buf["vehicles_busy"].mean().detach().cpu())
+        #     msg = {
+        #         "iter": it,
+        #         "team_reward_mean_rollout": float(rew_team_buf.mean().detach().cpu()),
+        #         "done_frac": float(done_buf.float().mean().detach().cpu()),
+        #         "loss_total": losses_acc["loss_total"] / denom,
+        #         "loss_pi": losses_acc["loss_pi"] / denom,
+        #         "loss_v": losses_acc["loss_v"] / denom,
+        #         "entropy": losses_acc["entropy"] / denom,
+        #         "deliveries_last": deliveries_last,
+        #         "deliveries_sum": deliveries_sum,
+        #         "deliveries_delta_sum": deliveries_delta_sum,
+        #         "stucks_mean": stucks_mean,
+        #         "busy_mean": busy_mean,
+        #     }
+        #     print(msg)
 
         # TODO: checkpoint + eval hooks
         if it % save_every == 0:
@@ -372,6 +435,10 @@ def main() -> None:
                 ckpt_path,
             )
             torch.save({"path": str(ckpt_path)}, ckpt_dir / "latest.pt")
+
+        # ---- reset stats buffers for next rollout
+        for k in stats_keys:
+            stats_buf[k].zero_()
 
 
 if __name__ == "__main__":

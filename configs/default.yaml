@@ -1,0 +1,42 @@
+run:
+  experiment: tarware_mappo_baseline
+  root: runs
+  seed: 0
+  device: cpu
+  tensorboard: true
+  updates: 500
+  eval_every: 25
+  ckpt_every: 25
+  eval_episodes: 10
+  eval_greedy: false
+
+env:
+  # Use a TA-RWARE registered gym id (adjust to your installation)
+  env_id: tarware-tiny-3agvs-2pickers-partialobs-v1
+  seed: 0
+  episode_horizon: 500
+  reward_mode: team_sum
+  env_kwargs: {}
+
+algo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  lr_actor: 1.0e-4
+  lr_critic: 1.0e-3
+  max_grad_norm: 0.5
+
+  rollout_len_T: 128
+  ppo_epochs_K: 4
+  minibatch_size: 256
+
+  num_envs_E: 1
+  use_agent_id: true
+  use_role_id: true
+  num_roles: 2
+  embed_dim: 16
+  actor_hidden: [256, 256]
+  critic_hidden: [256, 256]
+  value_clip: false

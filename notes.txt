@@ -1,0 +1,24 @@
+Problems and Results
+
+Deliveries is 0 in initial training run
+
+
+MAPPO design choices for TA-RWARE
+
+TA-RWARE has roles (AGVs vs pickers). You’ll likely do one of these:
+
+Option A (recommended): Shared actor + role/agent-id embedding
+
+One actor network shared by all agents.
+
+Input = agent obs + one-hot role (AGV/picker) or learned embedding.
+
+Good sample efficiency; simple.
+
+Option B: Separate policies per role
+
+One actor for AGVs, one for pickers.
+
+Sometimes trains cleaner if obs/action semantics differ a lot.
+
+Critic can still be one shared centralized critic.
